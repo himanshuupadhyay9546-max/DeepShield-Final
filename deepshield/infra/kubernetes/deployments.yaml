@@ -1,0 +1,265 @@
+# ── DeepShield Enterprise — Kubernetes Manifests ──────────────────────────
+# Apply with: kubectl apply -f kubernetes/
+# Namespace: deepshield-prod
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: deepshield-prod
+  labels:
+    app: deepshield
+    environment: production
+---
+# ── ConfigMap ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deepshield-config
+  namespace: deepshield-prod
+data:
+  CORS_ORIGINS: "https://app.deepshield.ai,https://admin.deepshield.ai"
+  ALLOWED_HOSTS: "api.deepshield.ai"
+  JWT_EXPIRE_SECONDS: "3600"
+  MLFLOW_TRACKING_URI: "http://mlflow-service:5000"
+---
+# ── API Gateway Deployment ─────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepshield-api
+  namespace: deepshield-prod
+  labels:
+    app: deepshield-api
+    version: v2
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: deepshield-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: deepshield-api
+        version: v2
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: [deepshield-api]
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: api
+          image: ghcr.io/deepshield/api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: deepshield-config
+            - secretRef:
+                name: deepshield-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          volumeMounts:
+            - name: model-weights
+              mountPath: /app/models
+              readOnly: true
+      volumes:
+        - name: model-weights
+          persistentVolumeClaim:
+            claimName: model-weights-pvc
+---
+# ── API Service ────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepshield-api-service
+  namespace: deepshield-prod
+spec:
+  selector:
+    app: deepshield-api
+  ports:
+    - port: 80
+      targetPort: 8000
+  type: ClusterIP
+---
+# ── HPA — API Gateway ─────────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: deepshield-api-hpa
+  namespace: deepshield-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: deepshield-api
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+---
+# ── Detection Worker Deployment (GPU nodes) ────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepshield-worker-detection
+  namespace: deepshield-prod
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: deepshield-worker-detection
+  template:
+    metadata:
+      labels:
+        app: deepshield-worker-detection
+    spec:
+      nodeSelector:
+        accelerator: nvidia-gpu
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: worker
+          image: ghcr.io/deepshield/api:latest
+          command:
+            - celery
+            - -A
+            - core.celery_app
+            - worker
+            - --loglevel=info
+            - --concurrency=4
+            - --queues=detection
+          envFrom:
+            - configMapRef:
+                name: deepshield-config
+            - secretRef:
+                name: deepshield-secrets
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "16Gi"
+              nvidia.com/gpu: "1"
+---
+# ── HPA — Detection Workers ────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: deepshield-detection-hpa
+  namespace: deepshield-prod
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: deepshield-worker-detection
+  minReplicas: 5
+  maxReplicas: 100
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: redis_queue_length
+          selector:
+            matchLabels:
+              queue: detection
+        target:
+          type: AverageValue
+          averageValue: "50"
+---
+# ── Ingress with TLS ───────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: deepshield-ingress
+  namespace: deepshield-prod
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/rate-limit: "1000"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "500m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  tls:
+    - hosts:
+        - api.deepshield.ai
+        - app.deepshield.ai
+      secretName: deepshield-tls
+  rules:
+    - host: api.deepshield.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: deepshield-api-service
+                port:
+                  number: 80
+    - host: app.deepshield.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: deepshield-frontend-service
+                port:
+                  number: 80
+---
+# ── PVC for model weights ──────────────────────────────────────────────────
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-weights-pvc
+  namespace: deepshield-prod
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 50Gi
